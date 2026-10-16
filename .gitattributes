@@ -6,3 +6,5 @@
 *.jpeg binary
 *.gif binary
 *.webp binary
+
+*.dump binary

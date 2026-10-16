@@ -1,6 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { db } from './db.js'
+import { logError, logInfo } from './logger.js'
 
 async function main() {
   await db.query('CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())')
@@ -15,7 +16,7 @@ async function main() {
       await client.query(await readFile(path.join(directory, file), 'utf8'))
       await client.query('INSERT INTO schema_migrations(name) VALUES($1)', [file])
       await client.query('COMMIT')
-      console.log(`Applied ${file}`)
+      logInfo('Database migration applied', { migration: file })
     } catch (error) {
       await client.query('ROLLBACK')
       throw error
@@ -24,4 +25,4 @@ async function main() {
   await db.end()
 }
 
-main().catch((error) => { console.error(error); process.exit(1) })
+main().catch((error) => { logError('Database migration failed', { error }); process.exit(1) })

@@ -1,7 +1,11 @@
 import express from 'express'
+import { createBullBoard } from '@bull-board/api'
+import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
+import { ExpressAdapter } from '@bull-board/express'
 import { ZodError, z } from 'zod'
 import { config } from './config.js'
 import { db, query, safeError } from './db.js'
+import { logError, logInfo, logWarn } from './logger.js'
 import { getQueue, queueNames, redis } from './queues.js'
 import { createJob, getJob, getTargets, resultPage, taskDone } from './repository.js'
 import { apiKey, verifySignature } from './security.js'
@@ -14,8 +18,16 @@ app.use(express.json({ limit: '2mb', verify: (req, _res, buffer) => { (req as ex
 app.get('/health', (_req, res) => res.json({ status: 'ok' }))
 app.get('/ready', async (_req, res) => {
   try { await Promise.all([db.query('SELECT 1'), redis.ping()]); res.json({ status: 'ready', postgres: 'ok', redis: 'ok' }) }
-  catch { res.status(503).json({ status: 'not_ready' }) }
+  catch (error) { logWarn('API readiness check failed', { error: safeError(error) }); res.status(503).json({ status: 'not_ready' }) }
 })
+
+const bullBoardAdapter = new ExpressAdapter()
+bullBoardAdapter.setBasePath('/admin/queues')
+createBullBoard({
+  queues: Object.values(queueNames).map((name) => new BullMQAdapter(getQueue(name))),
+  serverAdapter: bullBoardAdapter
+})
+app.use('/admin/queues', bullBoardAdapter.getRouter())
 
 app.use('/v1', apiKey)
 
@@ -25,8 +37,12 @@ app.post('/v1/scrape-jobs', async (req, res) => {
   if (input.transcription && !config.TRANSCRIPTION_ENABLED) return res.status(422).json({ error: 'Transcription is globally disabled' })
   if ((input.ocr || input.transcription) && (!config.S3_BUCKET || !config.S3_PUBLIC_BASE_URL)) return res.status(422).json({ error: 'S3_BUCKET and S3_PUBLIC_BASE_URL are required for enrichment' })
   const targets = input.feeds.map((feed) => ({ url: feed.url, platform: feed.platform ?? detectPlatform(feed.url) }))
+  if (!config.X_SCRAPING_ENABLED && targets.some((target) => target.platform === 'x')) {
+    return res.status(422).json({ error: 'X scraping is disabled; set X_SCRAPING_ENABLED=true in .env and restart the API and worker to enable it' })
+  }
   const jobId = await createJob(input, targets)
   await getQueue(queueNames.orchestrate).add('start', { jobId }, { jobId })
+  logInfo('Scrape job accepted', { jobId, targetCount: targets.length, platforms: [...new Set(targets.map((target) => target.platform))] })
   res.status(202).json({ id: jobId, status: 'queued', statusUrl: `${config.PUBLIC_BASE_URL}/v1/scrape-jobs/${jobId}`, resultsUrl: `${config.PUBLIC_BASE_URL}/v1/scrape-jobs/${jobId}/results` })
 })
 
@@ -87,11 +103,14 @@ for (const service of ['video-precheck','transcription','ocr'] as const) {
 }
 
 app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  if (error instanceof ZodError) return res.status(400).json({ error: 'validation_error', issues: error.issues })
-  console.error(error)
+  if (error instanceof ZodError) {
+    logWarn('API request validation failed', { issues: error.issues })
+    return res.status(400).json({ error: 'validation_error', issues: error.issues })
+  }
+  logError('API request failed', { error: safeError(error) })
   res.status(500).json({ error: safeError(error) })
 })
 
-const server = app.listen(config.PORT, '0.0.0.0', () => console.log(`Scraper API listening on ${config.PORT}`))
-async function shutdown() { server.close(); redis.disconnect(); await db.end(); process.exit(0) }
+const server = app.listen(config.PORT, '0.0.0.0', () => logInfo('Scraper API listening', { port: config.PORT }))
+async function shutdown() { logInfo('Scraper API shutting down'); server.close(); redis.disconnect(); await db.end(); process.exit(0) }
 process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown)

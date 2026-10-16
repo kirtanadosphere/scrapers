@@ -43,6 +43,8 @@ npm run dev:api
 npm run dev:worker
 ```
 
+The API and worker append timestamped operational events to `logs.txt` in the project root as well as printing them to the terminal. Logs include provider failures and an explicit message when a failed local scraper request is transferred to Apify. The log file is ignored by Git because it is a local runtime artifact.
+
 To inspect the database in Drizzle Studio, run this in another terminal after PostgreSQL is running:
 
 ```bash
@@ -66,6 +68,8 @@ Docker
 ## API
 
 All `/v1` endpoints require `X-API-Key`. `/health` and `/ready` are public.
+
+The Bull Board dashboard is available at `http://localhost:4000/admin/queues` (use the configured API port). It requires HTTP Basic Authentication: the username defaults to `admin`; the password is `BULL_BOARD_PASSWORD` when configured, otherwise the existing `API_KEY` value. Keep this dashboard private, and use a dedicated strong `BULL_BOARD_PASSWORD` if exposing the API beyond your local machine.
 
 Create a scrape job:
 
@@ -125,6 +129,8 @@ APIFY_API_KEY=your-apify-token
 ```
 
 Set `APIFY_FALLBACK_ENABLED=false` to prevent all automatic Apify fallback calls. Instagram and Facebook then use only their configured local scraper APIs, and YouTube captions use only `YOUTUBE_SCRAPER_BASE_URL`. X is unaffected because it has no Apify fallback.
+
+X scraping is disabled by default. Set `X_SCRAPING_ENABLED=true` in `.env` and restart both the API and worker to enable it. While disabled, requests containing an X feed are rejected with HTTP 422, and queued X jobs are prevented from calling the X API.
 
 Profile and posts are always scraped. Comments require `includeComments: true`. Pinned Instagram posts are skipped by default, X replies/retweets and YouTube live videos are excluded, and videos longer than 180 seconds are excluded unless the request supplies another allowed cap.
 

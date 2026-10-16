@@ -1,9 +1,10 @@
 import { Queue } from 'bullmq'
 import { Redis } from 'ioredis'
 import { config } from './config.js'
+import { logError } from './logger.js'
 
 export const redis = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null })
-redis.on('error', (error) => console.error('Redis connection error:', error.message))
+redis.on('error', (error) => logError('Redis connection error', { error: error.message }))
 export const queueNames = {
   orchestrate: 'orchestrate', profile: 'profile', posts: 'posts', comments: 'comments', media: 'media', captions: 'captions',
   precheck: 'video-precheck', transcription: 'transcription', ocr: 'ocr', callback: 'callback', cleanup: 'cleanup'

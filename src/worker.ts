@@ -6,6 +6,7 @@ import { Job, Worker } from 'bullmq'
 import { YtDlp } from 'ytdlp-nodejs'
 import { config } from './config.js'
 import { db, query, safeError } from './db.js'
+import { logError, logInfo } from './logger.js'
 import { getQueue, queueNames, redis, type QueueName } from './queues.js'
 import { addTasks, failTarget, getJob, getTargets, insertComment, insertContent, recordAttempt, taskDone, updateFeedProfile } from './repository.js'
 import { providersFor, withFallback } from './providers.js'
@@ -19,7 +20,16 @@ let ytDlp: YtDlp | undefined
 const getYtDlp = () => (ytDlp ??= new YtDlp())
 const worker = (name: QueueName, processor: (job: Job) => Promise<unknown>, concurrency = 5) => {
   const instance = new Worker(name, processor, { connection, prefix: config.QUEUE_PREFIX, concurrency, limiter: { max: 100, duration: 60000 } })
-  instance.on('failed', (job, error) => console.error(`${name}:${job?.id} failed`, safeError(error)))
+  instance.on('failed', (job, error) => logError('Queue job failed', {
+    queue: name, jobId: job?.id ?? null, jobName: job?.name ?? null,
+    attemptsMade: job?.attemptsMade ?? null, maxAttempts: job?.opts.attempts ?? 1,
+    willRetry: Boolean(job && job.attemptsMade < (job.opts.attempts ?? 1)),
+    failedReason: job?.failedReason ?? null,
+    jobContext: job ? Object.fromEntries(['jobId','targetId','postId','mediaId','requestId'].filter((key) => job.data?.[key] !== undefined).map((key) => [key, job.data[key]])) : null,
+    error,
+  }))
+  instance.on('error', (error) => logError('Queue worker infrastructure error', { queue: name, error }))
+  instance.on('stalled', (jobId) => logError('Queue job stalled and will be retried', { queue: name, jobId }))
   workers.push(instance); return instance
 }
 const cancelled = async (jobId: string) => Boolean((await getJob(jobId))?.cancel_requested)
@@ -37,6 +47,7 @@ worker(queueNames.orchestrate, async (bullJob) => {
   if (await cancelled(jobId)) return
   await query("UPDATE scrape_jobs SET status='running',started_at=COALESCE(started_at,now()) WHERE id=$1", [jobId])
   const targets = await getTargets(jobId)
+  logInfo('Scrape job started', { jobId, targetCount: targets.length })
   for (const target of targets) {
     await query("UPDATE job_targets SET pending_tasks=1,status='running' WHERE id=$1", [target.id])
     await getQueue(queueNames.profile).add('scrape', { jobId, targetId: target.id }, { jobId: `${jobId}:${target.id}:profile` })
@@ -53,7 +64,7 @@ worker(queueNames.profile, async (bullJob) => {
     await addTasks(targetId, 1)
     await getQueue(queueNames.posts).add('scrape', { jobId,targetId,profile }, { jobId: `${jobId}:${targetId}:posts` })
     await taskDone(jobId,targetId)
-  } catch (error) { await failTarget(jobId,targetId,error); await maybeCallback(jobId) }
+  } catch (error) { logError('Profile scrape failed', { jobId, targetId, platform: target?.platform, inputUrl: target?.input_url, error }); await failTarget(jobId,targetId,error); await maybeCallback(jobId) }
 })
 
 worker(queueNames.posts, async (bullJob) => {
@@ -83,7 +94,7 @@ worker(queueNames.posts, async (bullJob) => {
     for (const task of tasks) await getQueue(task.queue).add(task.name,task.data,{jobId:task.id})
     await taskDone(jobId,targetId)
     await maybeCallback(jobId)
-  } catch (error) { await taskDone(jobId,targetId,error); await maybeCallback(jobId) }
+  } catch (error) { logError('Posts scrape failed', { jobId, targetId, platform: target?.platform, inputUrl: target?.input_url, error }); await taskDone(jobId,targetId,error); await maybeCallback(jobId) }
 })
 
 worker(queueNames.comments, async (bullJob) => {
@@ -94,7 +105,7 @@ worker(queueNames.comments, async (bullJob) => {
       for (const item of items) await insertComment(jobId,postId,platform,item)
     }
     await taskDone(jobId,targetId)
-  } catch (error) { await taskDone(jobId,targetId,error) }
+  } catch (error) { logError('Comments scrape failed', { jobId, targetId, platform, postId, error }); await taskDone(jobId,targetId,error) }
   await maybeCallback(jobId)
 })
 
@@ -110,7 +121,7 @@ worker(queueNames.captions, async (bullJob) => {
       await getQueue(queueNames.media).add('copy',{jobId,targetId,postId,postType:'video',media:{type:'video',url:post.url},input},{jobId:`${jobId}:${postId}:youtube-media`})
     }
     await taskDone(jobId,targetId)
-  } catch (error) { await taskDone(jobId,targetId,error) }
+  } catch (error) { logError('YouTube captions processing failed', { jobId, targetId, postId, error }); await taskDone(jobId,targetId,error) }
   await maybeCallback(jobId)
 }, 10)
 
@@ -143,13 +154,14 @@ worker(queueNames.media, async (bullJob) => {
       await addTasks(targetId,1); await getQueue(queueNames.precheck).add('dispatch',{jobId,targetId,postId,mediaId,mediaUrl:stored.durableUrl})
     }
     await taskDone(jobId,targetId)
-  } catch(error){ await taskDone(jobId,targetId,error) }
+  } catch(error){ logError('Media processing failed', { jobId, targetId, postId, postType, mediaType: media?.type, mediaUrl: media?.url, s3Bucket: config.S3_BUCKET, error }); await taskDone(jobId,targetId,error) }
   await maybeCallback(jobId)
 },3)
 
 async function dispatch(serviceUrl:string,path:string,data:any) {
   if (!serviceUrl) throw new Error(`${path} service URL is not configured`)
   const timestamp=Math.floor(Date.now()/1000).toString(); const body=JSON.stringify(data)
+  logInfo('Dispatching enrichment request', { path, requestId: data.requestId, postId: data.postId })
   await axios.post(`${serviceUrl.replace(/\/$/,'')}${path}`,data,{timeout:config.PROVIDER_TIMEOUT_MS,headers:{'x-webhook-timestamp':timestamp,'x-webhook-signature':hmac(config.ENRICHMENT_WEBHOOK_SECRET,timestamp,body)}})
 }
 worker(queueNames.precheck, async (job)=>{ const d=job.data; await dispatch(config.VIDEO_PRECHECK_SERVICE_URL,'/precheck-requests',{requestId:`precheck-${d.postId}`,postId:d.postId,contentId:d.postId,transcriptMediaUrl:d.mediaUrl,webhookUrl:`${config.PUBLIC_BASE_URL}/v1/webhooks/video-precheck`}) })
@@ -179,6 +191,6 @@ worker(queueNames.cleanup, async (bullJob)=>{
 },1)
 
 await getQueue(queueNames.cleanup).upsertJobScheduler('retention-daily',{every:86400000},{name:'retention',data:{}})
-console.log('Scraper workers started')
-async function shutdown(){await Promise.all(workers.map((item)=>item.close()));redis.disconnect();await db.end();process.exit(0)}
+logInfo('Scraper workers started', { queues: workers.map((item) => item.name) })
+async function shutdown(){logInfo('Scraper workers shutting down');await Promise.all(workers.map((item)=>item.close()));redis.disconnect();await db.end();process.exit(0)}
 process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown)

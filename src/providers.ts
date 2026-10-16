@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { config } from './config.js'
+import { logApifyFallback, logError, logInfo, logWarn } from './logger.js'
 import { formatLocalScraperDate } from './provider-utils.js'
 import type { CreateJobInput, NormalizedComment, NormalizedPost, NormalizedProfile, Platform, Provider } from './types.js'
 
@@ -120,6 +121,7 @@ const facebookFallback: Provider = {
 const xProvider: Provider = {
   id: 'x-api-v2',
   async profile(url) {
+    if (!config.X_SCRAPING_ENABLED) throw new Error('X scraping is disabled; set X_SCRAPING_ENABLED=true in .env and restart the worker to enable it')
     if (!config.X_API_TOKEN) throw new Error('X_API_TOKEN is not configured')
     const username = usernameFromUrl(url)
     const response = await http.get(`https://api.x.com/2/users/by/username/${username}`, { headers: { Authorization: `Bearer ${config.X_API_TOKEN}` }, params: { 'user.fields': 'description,name,profile_image_url,public_metrics,username,verified' } })
@@ -128,6 +130,7 @@ const xProvider: Provider = {
     return { externalId: item.id, username: item.username, name: item.name, description: str(item.description), profileImageUrl: str(item.profile_image_url), followersCount: num(item.public_metrics?.followers_count), followingCount: num(item.public_metrics?.following_count), postsCount: num(item.public_metrics?.tweet_count), verified: item.verified ?? null, raw: item }
   },
   async posts(_url, profile, input) {
+    if (!config.X_SCRAPING_ENABLED) throw new Error('X scraping is disabled; set X_SCRAPING_ENABLED=true in .env and restart the worker to enable it')
     const response = await http.get(`https://api.x.com/2/users/${profile.externalId}/tweets`, { headers: { Authorization: `Bearer ${config.X_API_TOKEN}` }, params: { max_results: Math.max(5, Math.min(input.postLimit, 100)), start_time: input.startDate, end_time: input.endDate, exclude: 'replies,retweets', expansions: 'attachments.media_keys', 'tweet.fields': 'attachments,author_id,conversation_id,created_at,entities,public_metrics,text', 'media.fields': 'duration_ms,media_key,preview_image_url,type,url,variants' } })
     const mediaMap = new Map((response.data.includes?.media ?? []).map((m: any) => [m.media_key, m]))
     return (response.data.data ?? []).map((item: any) => {
@@ -139,6 +142,7 @@ const xProvider: Provider = {
     }).filter((post: NormalizedPost) => !post.durationSeconds || post.durationSeconds <= input.maxVideoDurationSeconds)
   },
   async comments(post, limit) {
+    if (!config.X_SCRAPING_ENABLED) throw new Error('X scraping is disabled; set X_SCRAPING_ENABLED=true in .env and restart the worker to enable it')
     if (!post.conversationId) return []
     const response = await http.get('https://api.x.com/2/tweets/search/recent', { headers: { Authorization: `Bearer ${config.X_API_TOKEN}` }, params: { query: `conversation_id:${post.conversationId}`, max_results: Math.max(10, Math.min(limit, 100)), expansions: 'author_id', 'tweet.fields': 'author_id,conversation_id,created_at,public_metrics,text', 'user.fields': 'name,username' } })
     const users = new Map((response.data.includes?.users ?? []).map((u: any) => [u.id, u]))
@@ -205,11 +209,18 @@ const youtubeProvider: Provider = {
         const tracks = payload(response)!.captions ?? []
         const text = tracks.find((track: any) => str(track.text))?.text
         if (text) return text.trim()
+        logWarn('Local YouTube captions API returned no captions', { postId: post.externalId })
       } catch (error: any) {
-        if (error?.response?.status && [400, 404, 422].includes(error.response.status)) return null
+        const status = error?.response?.status
+        logError('Local YouTube captions API failed', { postId: post.externalId, status: status ?? null, error: error instanceof Error ? error.message : String(error) })
+        if (status && [400, 404, 422].includes(status)) return null
       }
     }
-    if (!config.APIFY_FALLBACK_ENABLED || !config.APIFY_API_KEY) return null
+    if (!config.APIFY_FALLBACK_ENABLED || !config.APIFY_API_KEY) {
+      logWarn('Apify captions fallback unavailable', { postId: post.externalId, enabled: config.APIFY_FALLBACK_ENABLED, hasApiKey: Boolean(config.APIFY_API_KEY) })
+      return null
+    }
+    logApifyFallback('Local YouTube captions unavailable; transferring request to Apify', { postId: post.externalId, reason: config.YOUTUBE_SCRAPER_BASE_URL ? 'local API failed or returned no captions' : 'local API is not configured', fallbackProvider: 'streamers/youtube-scraper' })
     const items = await apifyItems('streamers/youtube-scraper', { startUrls: [{ url: post.url }], maxResults: 1, subtitlesLanguage: 'any' })
     const subtitles = items[0]?.subtitles ?? items[0]?.captions ?? []
     return str(subtitles.find((caption: any) => caption.type === 'auto_generated' && caption.plaintext)?.plaintext)
@@ -226,15 +237,48 @@ export const providersFor = (platform: Platform) => chains[platform]
 
 export async function withFallback<T>(jobId: string, targetId: string, platform: Platform, capability: keyof Provider, execute: (provider: Provider) => Promise<T>, record: (provider: string, status: string, duration: number, error?: string) => Promise<void>): Promise<T> {
   let last: unknown
-  for (const provider of providersFor(platform)) {
+  const chain = providersFor(platform)
+  for (const [index, provider] of chain.entries()) {
     if (typeof provider[capability] !== 'function') continue
     const started = Date.now()
-    try { const result = await execute(provider); await record(provider.id, 'success', Date.now() - started); return result }
+    try {
+      const result = await execute(provider)
+      const duration = Date.now() - started
+      await record(provider.id, 'success', duration)
+      logInfo('Scrape provider succeeded', { jobId, targetId, platform, capability, provider: provider.id, durationMs: duration })
+      return result
+    }
     catch (error: any) {
       last = error
-      await record(provider.id, 'failed', Date.now() - started, error instanceof Error ? error.message : String(error))
+      const errorMessage = error instanceof Error ? error.message : String(error)
       const status = error?.response?.status
-      if (status && [400, 401, 403, 422].includes(status)) throw error
+      const nextProvider = chain.slice(index + 1).find((candidate) => typeof candidate[capability] === 'function')
+      const responseData = error?.response?.data
+      const responseDetails = typeof responseData === 'string' ? responseData.slice(0, 4000) : responseData ?? null
+      logError('Scrape provider attempt failed', {
+        jobId,
+        targetId,
+        platform,
+        capability,
+        provider: provider.id,
+        status: status ?? null,
+        durationMs: Date.now() - started,
+        error: errorMessage,
+        request: error?.config ? { method: error.config.method, url: error.config.url, params: error.config.params } : null,
+        responseData: responseDetails
+      })
+      await record(provider.id, 'failed', Date.now() - started, errorMessage)
+      if (status && [400, 401, 403, 422].includes(status)) {
+        if (nextProvider) logWarn('Provider fallback skipped for non-retryable response', { jobId, targetId, platform, capability, failedProvider: provider.id, fallbackProvider: nextProvider.id, status })
+        throw error
+      }
+      if (nextProvider) {
+        const isApifyFallback = provider.id.endsWith('-internal') && nextProvider.id.startsWith('apify-')
+        const message = isApifyFallback ? 'Local scraper API failed; transferring request to Apify' : 'Provider failed; trying fallback provider'
+        const context = { jobId, targetId, platform, capability, failedProvider: provider.id, fallbackProvider: nextProvider.id, status: status ?? null, error: errorMessage }
+        if (isApifyFallback) logApifyFallback(message, context)
+        else logWarn(message, context)
+      }
     }
   }
   throw last ?? new Error(`No provider supports ${String(capability)}`)
